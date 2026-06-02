@@ -2,10 +2,13 @@
 import subprocess
 import os
 import re
+import tempfile
+import binascii
 
 class TSKWrapper:
     def __init__(self):
         self.current_image = None
+        self.current_offset = 0
         
     def check_tsk_installed(self):
         """Verify that Sleuth Kit tools are available"""
@@ -23,6 +26,8 @@ class TSKWrapper:
         if not self.check_tsk_installed():
             raise Exception("The Sleuth Kit (TSK) is not installed or not in PATH. Please install it first.")
             
+        self.current_image = image_path
+        
         result = {
             'image_path': image_path,
             'partitions': [],
@@ -81,16 +86,90 @@ class TSKWrapper:
         
     def list_directory(self, image_path, offset=0, inode=None):
         """List directory contents using fls"""
-        cmd = ['fls', '-o', str(offset // 512), image_path]
+        self.current_offset = offset
+        sector_offset = offset // 512
+        
+        cmd = ['fls', '-o', str(sector_offset), image_path]
         if inode:
-            cmd.extend(['-f', str(inode)])
+            cmd.extend([str(inode)])
             
         try:
             output = subprocess.run(cmd, capture_output=True, text=True, check=True)
             return self._parse_fls_output(output.stdout)
         except subprocess.CalledProcessError as e:
             return {'error': e.stderr}
+    
+    def get_deleted_files(self, image_path, offset=0):
+        """Get only deleted files using fls -d"""
+        sector_offset = offset // 512
+        cmd = ['fls', '-d', '-o', str(sector_offset), image_path]
+        
+        try:
+            output = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return self._parse_fls_output(output.stdout)
+        except subprocess.CalledProcessError as e:
+            return {'error': e.stderr}
+    
+    def get_file_metadata(self, image_path, offset, inode):
+        """Get file metadata using istat"""
+        sector_offset = offset // 512
+        cmd = ['istat', '-o', str(sector_offset), image_path, str(inode)]
+        
+        try:
+            output = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return output.stdout
+        except subprocess.CalledProcessError as e:
+            return f"Error getting metadata: {e.stderr}"
+    
+    def recover_file(self, image_path, offset, inode, output_path):
+        """Recover a deleted or existing file using icat"""
+        sector_offset = offset // 512
+        cmd = ['icat', '-o', str(sector_offset), image_path, str(inode)]
+        
+        try:
+            with open(output_path, 'wb') as outfile:
+                result = subprocess.run(cmd, capture_output=True, check=True)
+                outfile.write(result.stdout)
+            return True, f"File recovered to: {output_path}"
+        except subprocess.CalledProcessError as e:
+            return False, f"Recovery failed: {e.stderr}"
+    
+    def get_hex_view(self, image_path, offset, inode, block_size=512, num_blocks=4):
+        """Get hexadecimal view of file blocks using icat and hexdump"""
+        sector_offset = offset // 512
+        cmd = ['icat', '-o', str(sector_offset), image_path, str(inode)]
+        
+        try:
+            result = subprocess.run(cmd, capture_output=True, check=True)
+            data = result.stdout[:block_size * num_blocks]  # Limit to prevent memory issues
             
+            # Format as hex
+            hex_output = []
+            for i in range(0, len(data), 16):
+                chunk = data[i:i+16]
+                hex_part = ' '.join(f'{b:02x}' for b in chunk)
+                ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+                hex_output.append(f'{i:08x}  {hex_part:<48}  {ascii_part}')
+            
+            return '\n'.join(hex_output)
+        except subprocess.CalledProcessError as e:
+            return f"Error reading hex data: {e.stderr}"
+    
+    def search_hex_pattern(self, image_path, offset, pattern_hex):
+        """Search for hex pattern in the filesystem"""
+        # This uses blkls to search raw data (simplified version)
+        sector_offset = offset // 512
+        pattern_bytes = bytes.fromhex(pattern_hex.replace(' ', ''))
+        
+        # Use dd + grep style search (basic implementation)
+        cmd = f"blkls -o {sector_offset} {image_path} 2>/dev/null | hexdump -C | grep -i '{pattern_hex}'"
+        
+        try:
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            return result.stdout if result.stdout else "Pattern not found"
+        except Exception as e:
+            return f"Search error: {str(e)}"
+        
     def _parse_fls_output(self, output):
         """Parse fls output into structured data"""
         files = []
@@ -98,11 +177,11 @@ class TSKWrapper:
         for line in lines:
             if not line.strip():
                 continue
-            # Typical fls line: "r/r 1234: file.txt"
-            parts = line.split(':')
-            if len(parts) >= 2:
+            # Typical fls line: "r/r 1234:  file.txt"
+            if ':' in line:
+                parts = line.split(':', 1)
                 meta_part = parts[0].strip()
-                name = parts[1].strip()
+                name = parts[1].strip() if len(parts) > 1 else ''
                 
                 # Parse permission and inode
                 meta_parts = meta_part.split()
@@ -111,12 +190,23 @@ class TSKWrapper:
                     inode = meta_parts[1]
                     
                     # Determine if deleted (look for 'd' or alloc flag)
-                    is_deleted = '*' in perm or 'd' in perm
+                    is_deleted = '*' in perm or 'd' in perm or 'u' in perm.lower()
+                    
+                    # Determine file type
+                    if 'r/r' in perm:
+                        file_type = "📄 File"
+                    elif 'd/d' in perm:
+                        file_type = "📁 Directory"
+                    elif 'l/l' in perm:
+                        file_type = "🔗 Link"
+                    else:
+                        file_type = "❓ Unknown"
                     
                     files.append({
                         'name': name,
                         'inode': inode,
                         'permissions': perm,
-                        'deleted': is_deleted
+                        'deleted': is_deleted,
+                        'type': file_type
                     })
         return files
